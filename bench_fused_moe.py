@@ -11,6 +11,8 @@ from aiter.utility import fp4_utils
 from aiter.jit.utils.chip_info import get_gfx
 import argparse
 import pandas as pd
+import torch.profiler as profiler
+from torch.profiler import tensorboard_trace_handler
 
 from aiter.fused_moe import (
     fused_topk,
@@ -47,7 +49,7 @@ def generate_data(total_token, num_global_expert, num_local_expert, model_dim, t
 @benchmark()
 def test_fmoe(
     dtype,
-    m_per_expert,
+    bs_per_rank,
     model_dim,
     inter_dim,
     num_global_expert,
@@ -59,14 +61,18 @@ def test_fmoe(
     WQDType,
     use_g1u1=False,
     doweight_stage1=False,
+    torch_profile=False,
 ):
     if get_gfx() not in ["gfx950"] and qType == aiter.QuantType.per_1x32:
         return
     torch_quant = aiter.get_torch_quant(qType)
     torch_act = aiter.get_torch_act(actType)
-    total_token = m_per_expert * num_global_expert // topk
+    ep_size = num_global_expert // num_local_expert
+    total_token = bs_per_rank * ep_size
     input_x, topk_ids, topk_weights = generate_data(total_token, num_global_expert, num_local_expert, model_dim, topk, dtype)
+    
     token = input_x.shape[0]
+
     if use_g1u1:
         w1 = torch.randn((num_local_expert, inter_dim * 2, model_dim), dtype=dtype)
     else:
@@ -174,6 +180,7 @@ def test_fmoe(
             doweight_stage1=doweight_stage1,
             expert_mask=expert_mask,
             dtype=torch.bfloat16,
+            needTrace=torch_profile,
         )
         w1_matmul_flops = model_dim * inter_dim * 2
         if use_g1u1:
@@ -183,13 +190,13 @@ def test_fmoe(
         total_flops = (w1_matmul_flops + w2_matmul_flops) * act_tokens
         actual_tflops = (total_flops / us_fuse) / 1e6
 
-        return {"us": us_fuse, "act_tokens_per_exp": act_tokens // num_local_expert, "tflops": actual_tflops, }
+        return {"us": us_fuse, "act_tokens": act_tokens, "tflops": actual_tflops, 'm_per_expert': bs_per_rank * topk // num_local_expert}
 
 
-l_dtype = ["bf16", "fp16"][:1]
+l_dtype = ["bf16",]
 l_dim = [(7168, 2048)]
-l_token_per_expert = [
-    2,
+l_bs_per_rank = [
+    # 1,
     4,
     8,
     16,
@@ -200,9 +207,8 @@ l_token_per_expert = [
     512,
     1024,
     2048,
-    4096,
-    8192,
-    16384,
+    # 4096,
+    # 8192
 ]
 l_quant = [
     # (aiter.QuantType.No, None, None),  # a16w16
@@ -214,7 +220,7 @@ l_quant = [
 ]
 l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
 # l_doweight_stage1 = [False, True]
-l_doweight_stage1 = [True]
+l_doweight_stage1 = [False]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -314,6 +320,11 @@ parser.add_argument(
     e.g.: -k 8""",
 )
 
+parser.add_argument(
+    "--profile",
+    action="store_true",
+)
+
 args = parser.parse_args()
 if args.dtype is None:
     l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
@@ -324,7 +335,7 @@ if args.dim is not None:
     l_dim = [args.dim]
 
 if args.tokenNum is not None:
-    l_token_per_expert = [args.tokenNum]
+    l_bs_per_rank = [args.tokenNum]
 
 l_quant = [l_quant[args.quant]] if args.quant is not None else l_quant
 
@@ -342,10 +353,10 @@ for (
     doweight_stage1,
 ) in itertools.product(l_dtype, l_act, l_quant, l_dim, l_doweight_stage1):
     df = []
-    for m_per_expert in l_token_per_expert:
+    for bs_per_rank in l_bs_per_rank:
         ret = test_fmoe(
             dtype,
-            m_per_expert,
+            bs_per_rank,
             model_dim,
             inter_dim,
             args.num_global_expert,
@@ -357,8 +368,12 @@ for (
             wq_dtype,
             use_g1u1=True,
             doweight_stage1=doweight_stage1,
+            torch_profile=args.profile,
         )
         df.append(ret)
     df = pd.DataFrame(df)
     # aiter.logger.info(f"summary:\n{df.to_string()}")
-    aiter.logger.info(f"summary:\n{df[['m_per_expert', 'us', 'act_tokens_per_exp', 'tflops']].to_string(index=False)}")
+    df = df[['bs_per_rank', 'm_per_expert', 'us', 'act_tokens', 'tflops']]
+    aiter.logger.info(f"summary:\n{df.to_string(index=False)}")
+    ep_size = args.num_global_expert // args.num_local_expert
+    df.to_csv(f'csv_ep{ep_size}.csv', index=False)
