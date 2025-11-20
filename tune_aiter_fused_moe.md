@@ -2,7 +2,7 @@
 
 find `aiter/configs/untuned_fmoe.csv`
 
-type the config you need
+type the config you need. Please note that the token max number is 1024
 
 for example
 
