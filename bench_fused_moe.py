@@ -160,9 +160,16 @@ def test_fmoe(
     if dtype == dtypes.bf16:
         from aiter import QuantType, get_hip_quant
 
-        quant_func = get_hip_quant(QuantType.per_Token)
-        a1q, a1q_scale = quant_func(input_x, quant_dtype=AQDType)
-
+        if qType == aiter.QuantType.per_128x128:
+            quant_func = get_hip_quant(QuantType.per_1x128)
+        elif qType == aiter.QuantType.per_Tensor:
+            quant_func = get_hip_quant(qType)
+        else:
+            raise RuntimeError
+        random_padding = torch.randn((4096*16-input_x.shape[0], input_x.shape[1]), dtype=input_x.dtype, device=input_x.device)
+        padded_tensor = torch.cat([input_x, random_padding], dim=0)
+        a1q, a1q_scale = quant_func(padded_tensor, quant_dtype=AQDType)
+        print(f'{w1_qt_aiter.shape=} {w1_qt_aiter.dtype=} {w1_scale.shape=} {w1_scale.dtype=}')
         out2_aiter, us_fuse = run_perftest(
             fused_moe,
             a1q,
@@ -179,6 +186,7 @@ def test_fmoe(
             activation=actType,
             doweight_stage1=doweight_stage1,
             expert_mask=expert_mask,
+            num_local_tokens=torch.tensor([input_x.shape[0]], dtype=torch.int32),
             dtype=torch.bfloat16,
             needTrace=torch_profile,
         )
@@ -213,10 +221,10 @@ l_bs_per_rank = [
 l_quant = [
     # (aiter.QuantType.No, None, None),  # a16w16
     # (aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
-    (aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
+    # (aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
     # (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
     # (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2),  # a4w4
-    # (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
+    (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
 ]
 l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
 # l_doweight_stage1 = [False, True]
