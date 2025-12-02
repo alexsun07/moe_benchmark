@@ -53,8 +53,8 @@ def count_bytes(*tensors):
     return total
 
 
-def test_fp8_bmm(bs_per_rank=1024, perf_only=False):
-    print('Testing grouped masked FP8-GEMM:')
+def test_fp8_bmm(bs_per_rank=1024, perf_only=False, log_table=False):
+    print(f'Testing grouped masked FP8-GEMM: bs={bs_per_rank}')
     max_m = bs_per_rank * 2
     if not perf_only:
         # Test correctness
@@ -69,6 +69,8 @@ def test_fp8_bmm(bs_per_rank=1024, perf_only=False):
                         out,
                         ref_out,
                         msg=f"grouped masked FP8-GEMM FP8-GEMM {k=} {n=} {num_groups=} {expected_m_per_group=} ")
+    if log_table:
+        print(f'num_groups expected_m_per_group valid_m K N us TFLOPS Bandwidth')
     for num_groups, expected_m_per_group in ((1, bs_per_rank // 1), (2, bs_per_rank // 2), (4, bs_per_rank // 4), (8, bs_per_rank // 8), (16, bs_per_rank // 16), (32, bs_per_rank // 32)):
         # Test performance
         for k, n in ((7168, 4096), (2048, 7168), ):
@@ -86,10 +88,15 @@ def test_fp8_bmm(bs_per_rank=1024, perf_only=False):
             )
             t = us.item()
             valid_m = masked_m.sum().item()
-            print(f' > Perf ({num_groups=:3} expected_m={expected_m_per_group:4} valid_m={valid_m:4} {k=} {n=}): '
-                  f'{t :4.0f} us | '
-                  f'{2 * valid_m * n * k / t / 1e6:4.0f} TFLOPS | '
-                  f'{(count_bytes(x_fp8, out) * valid_m / (max_m * num_groups) + count_bytes(y_fp8)) / 1e3 / t:4.0f} GB/s')
+            tflops = 2 * valid_m * n * k / t / 1e6
+            bandwidth = (count_bytes(x_fp8, out) * valid_m / (max_m * num_groups) + count_bytes(y_fp8)) / 1e3 / t
+            if log_table:
+                print(f'{num_groups} {expected_m_per_group} {valid_m} {k} {n} {us:.0f} {t:.0f} {tflops:.0f} {bandwidth:.0f}')
+            else:
+                print(f' > Perf ({num_groups=:3} expected_m={expected_m_per_group:4} valid_m={valid_m:4} {k=} {n=}): '
+                      f'{t :4.0f} us | '
+                      f'{tflops:4.0f} TFLOPS | '
+                      f'{bandwidth:4.0f} GB/s')
 
 
 def test_bf16_bmm():
@@ -137,5 +144,6 @@ def get_fp8_bmm_trace():
 
 
 for bs in [64, 128, 256, 512, 1024, 2048, 4096]:
-    test_fp8_bmm(bs_per_rank=bs, perf_only=True)
+    test_fp8_bmm(bs_per_rank=bs, perf_only=True, log_table=False)
+    print()
 # get_fp8_bmm_trace()
