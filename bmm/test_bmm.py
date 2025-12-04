@@ -11,6 +11,31 @@ from aiter.ops.shuffle import shuffle_weight
 from aiter import dtypes
 
 
+def construct_unmasked_grouped(num_groups: int, m: int, k: int, n: int, quant_dtype=aiter.dtypes.fp8, dtypes=torch.bfloat16) -> \
+        Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor]:
+    x = torch.randn((num_groups, m, k), device='cuda', dtype=torch.bfloat16)
+    y = torch.randn((num_groups, n, k), device='cuda', dtype=torch.bfloat16)
+    out = torch.zeros((num_groups, m, n), device='cuda', dtype=torch.bfloat16)
+
+    x_fp8 = [torch.empty_like(x, dtype=quant_dtype), torch.empty((num_groups, m, 1), device='cuda', dtype=torch.float)]
+    y_fp8 = [torch.empty_like(y, dtype=quant_dtype), torch.empty((num_groups, n, 1), device='cuda', dtype=torch.float)]
+
+    if quant_dtype in [aiter.dtypes.fp8]:
+        torch_quant = aiter.get_triton_quant(aiter.QuantType.per_Token)
+        for i in range(num_groups):
+            x_fp8[0][i], x_fp8[1][i] = torch_quant(x[i], quant_dtype=quant_dtype)
+            y_fp8[0][i], y_fp8[1][i] = torch_quant(y[i], quant_dtype=quant_dtype)
+
+        x = x_fp8[0].to(float) * x_fp8[1]
+        y = y_fp8[0].to(float) * y_fp8[1]
+    else :
+        x_fp8[0] = x
+        y_fp8[0] = y
+
+    ref_out = torch.einsum('gmk,gnk->gmn', x, y).to(torch.bfloat16)
+    return x_fp8, y_fp8, out, ref_out
+
+
 def construct_masked_grouped(num_groups: int, max_m: int, expected_m_per_group: int, k: int, n: int, quant_dtype=aiter.dtypes.fp8, dtypes=torch.bfloat16) -> \
         Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
     x = torch.randn((num_groups, max_m, k), device='cuda', dtype=torch.bfloat16)
@@ -91,7 +116,7 @@ def test_fp8_bmm(bs_per_rank=1024, perf_only=False, log_table=False):
             tflops = 2 * valid_m * n * k / t / 1e6
             bandwidth = (count_bytes(x_fp8, out) * valid_m / (max_m * num_groups) + count_bytes(y_fp8)) / 1e3 / t
             if log_table:
-                print(f'{num_groups} {expected_m_per_group} {valid_m} {k} {n} {us:.0f} {t:.0f} {tflops:.0f} {bandwidth:.0f}')
+                print(f'{num_groups} {expected_m_per_group} {valid_m} {k} {n} {t:.0f} {tflops:.0f} {bandwidth:.0f}')
             else:
                 print(f' > Perf ({num_groups=:3} expected_m={expected_m_per_group:4} valid_m={valid_m:4} {k=} {n=}): '
                       f'{t :4.0f} us | '
@@ -143,7 +168,78 @@ def get_fp8_bmm_trace():
             f'{(count_bytes(x_fp8, out) * valid_m / (max_m * num_groups) + count_bytes(y_fp8)) / 1e3 / t:4.0f} GB/s')
 
 
-for bs in [64, 128, 256, 512, 1024, 2048, 4096]:
-    test_fp8_bmm(bs_per_rank=bs, perf_only=True, log_table=False)
-    print()
+def test_batched_gemm():
+    for num_groups in [1, 2, 4, 8, 16, 32]:
+        for k, n in [(7168, 4096), (2048, 7168)]:
+            m = 1024 // num_groups
+            # Test correctness
+            for _ in range(10):
+                x_fp8, y_fp8, out, ref_out = construct_unmasked_grouped(num_groups, m, k, n)
+                weightshuffle = shuffle_weight(y_fp8[0], layout=(16, 16))
+                bias = torch.zeros_like(out[0], dtype=torch.float32)
+                for i in range(num_groups):
+                    out[i] = aiter.gemm_a8w8_bpreshuffle(x_fp8[0][i], weightshuffle[i], x_fp8[1][i], y_fp8[1][i])
+
+                err = checkAllclose(
+                    out,
+                    ref_out,
+                    msg=f"")
+    for num_groups in [1, 2, 4, 8, 16, 32]:
+        m = 1024 // num_groups
+        for k, n in [(7168, 4096), (2048, 7168)]:
+            # Test performance
+            x_fp8, y_fp8, out, ref_out = construct_unmasked_grouped(num_groups, m, k, n)
+            weightshuffle = shuffle_weight(y_fp8[0], layout=(16, 16))
+            def bmm(x_fp8, y_fp8, out):
+                for i in range(num_groups):
+                    out[i] = aiter.gemm_a8w8_bpreshuffle(x_fp8[0][i], weightshuffle[i], x_fp8[1][i], y_fp8[1][i])
+            _, us = run_perftest(
+                bmm,
+                x_fp8,
+                y_fp8,
+                out,
+                needTrace=False,
+            )
+            t = us.item()
+            tflops = 2 * num_groups * m * n * k / t / 1e6
+            bandwidth = (count_bytes(x_fp8, out) + count_bytes(y_fp8)) / 1e3 / t
+            print(f' > Perf ({num_groups=:3} m={m:4} {k=} {n=}): '
+                    f'{t :4.0f} us | '
+                    f'{tflops:4.0f} TFLOPS | '
+                    f'{bandwidth:4.0f} GB/s')
+
+def get_bmm_trace():
+    num_groups = 2
+    k = 7168
+    n = 4096
+    m = 1024 // num_groups
+    # Test performance
+    x_fp8, y_fp8, out, ref_out = construct_unmasked_grouped(num_groups, m, k, n)
+    weightshuffle = shuffle_weight(y_fp8[0], layout=(16, 16))
+    def bmm(x_fp8, y_fp8, out):
+        for i in range(num_groups):
+            out[i] = aiter.gemm_a8w8_bpreshuffle(x_fp8[0][i], weightshuffle[i], x_fp8[1][i], y_fp8[1][i])
+    _, us = run_perftest(
+        bmm,
+        x_fp8,
+        y_fp8,
+        out,
+        needTrace=True,
+    )
+    t = us.item()
+    tflops = 2 * num_groups * m * n * k / t / 1e6
+    bandwidth = (count_bytes(x_fp8, out) + count_bytes(y_fp8)) / 1e3 / t
+    print(f' > Perf ({num_groups=:3} m={m:4} {k=} {n=}): '
+            f'{t :4.0f} us | '
+            f'{tflops:4.0f} TFLOPS | '
+            f'{bandwidth:4.0f} GB/s')
+
+
+
+# for bs in [64, 128, 256, 512, 1024, 2048, 4096]:
+#     test_fp8_bmm(bs_per_rank=bs, perf_only=True, log_table=False)
+#     print()
 # get_fp8_bmm_trace()
+# test_fp8_bmm()
+test_batched_gemm()
+# get_bmm_trace()
