@@ -46,7 +46,8 @@ def run_gemm_ck(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
 
 
 @benchmark()
-def test_gemm(dtype, m, n, k):
+def test_gemm(m, n, k):
+    dtype = torch.bfloat16
     dim = (m, n, k)
     block_shape_n, block_shape_k = block_shape
     scale_n = (n + block_shape_n - 1) // block_shape_n
@@ -63,6 +64,8 @@ def test_gemm(dtype, m, n, k):
     checkAllclose(a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01)
 
     return {
+        # "dtype": weight.dtype,
+        # "output dtype": b.dtype,
         "ck us": avg_b,
         "ck tflops": f'{m * n * k * 2 / avg_b / 1e6:.0f} TFLOPS',
         "ck BW": f'{(m * k + n * k + m * n) / avg_b / 1e3:.0f} GB/s',
@@ -124,47 +127,36 @@ def test_gemm_asm_mi350(dtype, m, n, k):
     checkAllclose(a, b, msg="a,b: " + msg, rtol=1e-2, atol=1e-2)
 
 
-l_dtype = ["bf16"]
 l_m = [
     # 64,
     # 128,
     # 256,
     # 512,
     # 1024,
-    763,
-    2048,
+    1,
+    128,
+    # 2048,
     4096,
-    7188,
+    # 7188,
     8192,
     # 16384,
     # 32768,
 ]
 l_nk = [
     # Qwen3-8B-FP8
-    (151936,4096),
-    (4096, 12288),
-    (6144, 4096),
-    (24576, 4096),
+    # (151936,4096),
+    # (4096, 12288),
+    # (6144, 4096),
+    # (24576, 4096),
     # 32B-FP8
-    # (10240,5120),
-    # (5120,8192),
-    # (10240,5120),
+    (10240,5120),
+    (5120,8192),
+    (10240,5120),
 ]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
-)
-parser.add_argument(
-    "-d",
-    "--dtype",
-    type=str,
-    choices=l_dtype,
-    nargs="?",
-    const=None,
-    default=None,
-    help="""Data type.
-    e.g.: -d bf16""",
 )
 parser.add_argument(
     "-m",
@@ -186,21 +178,16 @@ parser.add_argument(
 )
 
 args = parser.parse_args()
-if args.dtype is None:
-    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
-else:
-    l_dtype = [dtypes.d_dtypes[args.dtype]]
 if args.m is not None:
     l_m = [args.m]
 if args.nk is not None:
     l_nk = [args.nk]
 
-def test_normal_gemm_a8w8_blockscale(l_dtype, l_mnk):
+def test_normal_gemm_a8w8_blockscale(l_mnk):
     df = []
-    for dtype in l_dtype:
-        for m, n, k in l_mnk:
-            ret = test_gemm(dtype, m, n, k)
-            df.append(ret)
+    for m, n, k in l_mnk:
+        ret = test_gemm(m, n, k)
+        df.append(ret)
     df = pd.DataFrame(df)
     aiter.logger.info(f"summary:\n{df.to_string()}")
 
@@ -212,4 +199,4 @@ for m in l_m:
         l_mnk.append((m, n, k))
 # for m, n, k in l_mnk:
 #     print(f'{m},{n},{k}')
-test_normal_gemm_a8w8_blockscale(l_dtype, l_mnk)
+test_normal_gemm_a8w8_blockscale(l_mnk)
